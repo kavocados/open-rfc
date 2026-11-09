@@ -610,6 +610,89 @@ function short(value: string, length: number): string {
   return value.slice(0, length);
 }
 
+const PRINTABLE_ASCII = /^[\x20-\x7e]*$/u;
+
+/** Wire values derived from the local operating system, resolved once. */
+interface LocalWireIdentity {
+  /** APPC initialization user: the first 12 account-name characters. */
+  readonly operatingSystemUser: string;
+  /** CPIC logon partner host; the gateway record sends its first 8. */
+  readonly hostName: string;
+}
+
+function localEnvironmentFailure(
+  reasonCode: string,
+  message: string,
+): RfcCoreError {
+  // Raw OS errors and the names themselves can contain host or account data;
+  // neither is retained as a cause or interpolated into the fixed message.
+  return new RfcCoreError(createRfcFailure({
+    category: RfcFailureCategory.InvalidState,
+    origin: RfcFailureOrigin.Api,
+    phase: RfcOperationPhase.Connect,
+    transmission: RfcTransmissionState.NotStarted,
+    establishedSession: false,
+    reasonCode,
+    key: reasonCode,
+    message,
+  }));
+}
+
+/**
+ * Resolve and validate every OS-derived gateway, APPC, and CPIC logon value
+ * before a transport exists. The protocol encoders accept printable ASCII
+ * only, and no SDK-equivalent projection for other names is known, so an
+ * unsendable value fails closed instead of being substituted.
+ */
+function resolveLocalWireIdentity(): LocalWireIdentity {
+  let operatingSystemUser: string;
+  try {
+    const username: unknown = userInfo().username;
+    if (typeof username !== "string") throw new TypeError("username");
+    operatingSystemUser = short(username, 12);
+  } catch {
+    throw localEnvironmentFailure(
+      "RFC_OS_USER_UNAVAILABLE",
+      "The local operating-system user could not be resolved. " +
+        "Configure a resolvable OS account; containers need a passwd/NSS " +
+        "entry for the runtime UID.",
+    );
+  }
+  if (!PRINTABLE_ASCII.test(operatingSystemUser)) {
+    throw localEnvironmentFailure(
+      "RFC_OS_USER_UNSUPPORTED",
+      "The local operating-system user name cannot be sent: APPC " +
+        "initialization needs its first 12 characters to be printable " +
+        "ASCII. Run the process under an account with an ASCII name.",
+    );
+  }
+  let hostName: string;
+  try {
+    const resolved: unknown = hostname();
+    if (typeof resolved !== "string") throw new TypeError("hostname");
+    hostName = resolved;
+  } catch {
+    throw localEnvironmentFailure(
+      "RFC_LOCAL_HOSTNAME_UNAVAILABLE",
+      "The local host name could not be resolved. Configure a resolvable " +
+        "host name for the runtime environment.",
+    );
+  }
+  if (
+    hostName.length === 0 ||
+    hostName.length > 120 ||
+    !PRINTABLE_ASCII.test(hostName)
+  ) {
+    throw localEnvironmentFailure(
+      "RFC_LOCAL_HOSTNAME_UNSUPPORTED",
+      "The local host name cannot be sent: the gateway and CPIC logon " +
+        "records need 1..120 printable ASCII characters. Configure an " +
+        "ASCII host name.",
+    );
+  }
+  return Object.freeze({ operatingSystemUser, hostName });
+}
+
 function gatewayIpv4(address: string | undefined): string | undefined {
   if (address === undefined) return undefined;
   if (isIPv4(address)) return address;
@@ -689,6 +772,8 @@ export class DirectCpicSession {
   readonly #localAddress: string;
   readonly #destination: string;
   readonly #programName: string;
+  /** Host name validated before the transport opened; the logon default. */
+  readonly #localHostName: string;
   readonly #cpicStreaming: "disabled" | "enabled";
   readonly #recursiveSerializerDecisionProvider:
     RecursiveSerializerDecisionProvider | undefined;
@@ -714,6 +799,7 @@ export class DirectCpicSession {
     setup: AppcClientSetupStateMachine,
     destination: string,
     programName: string,
+    localHostName: string,
     cpicStreaming: "disabled" | "enabled",
     recursiveSerializerDecisionProvider:
       RecursiveSerializerDecisionProvider | undefined,
@@ -727,6 +813,7 @@ export class DirectCpicSession {
     this.#setup = setup;
     this.#destination = destination;
     this.#programName = programName;
+    this.#localHostName = localHostName;
     this.#cpicStreaming = cpicStreaming;
     this.#recursiveSerializerDecisionProvider =
       recursiveSerializerDecisionProvider;
@@ -768,25 +855,8 @@ export class DirectCpicSession {
     if (typeof transportFactory !== "function") {
       throw new TypeError("transportFactory must be a function");
     }
-    let operatingSystemUser: string;
-    try {
-      operatingSystemUser = short(userInfo().username, 12);
-    } catch {
-      // Resolve the local account before opening a transport. Raw OS errors
-      // can contain host or account data and are not retained as a cause.
-      throw new RfcCoreError(createRfcFailure({
-        category: RfcFailureCategory.InvalidState,
-        origin: RfcFailureOrigin.Api,
-        phase: RfcOperationPhase.Connect,
-        transmission: RfcTransmissionState.NotStarted,
-        establishedSession: false,
-        reasonCode: "RFC_OS_USER_UNAVAILABLE",
-        key: "RFC_OS_USER_UNAVAILABLE",
-        message: "The local operating-system user could not be resolved. " +
-          "Configure a resolvable OS account; containers need a passwd/NSS " +
-          "entry for the runtime UID.",
-      }));
-    }
+    // Fail on the local environment before any gateway connection exists.
+    const localIdentity = resolveLocalWireIdentity();
     const transport = await Reflect.apply(transportFactory, undefined, [
       transportOptions,
       sessionOptions.signal,
@@ -820,7 +890,7 @@ export class DirectCpicSession {
           service: short(programName, 9),
           codePage: "1100",
           gatewayOptionLevel: 6,
-          logicalUnit: short(hostname(), 8),
+          logicalUnit: short(localIdentity.hostName, 8),
           transactionProgram: short(programName, 8),
           conversationId: "",
           appcHeaderVersion: 6,
@@ -893,7 +963,7 @@ export class DirectCpicSession {
             networkProtocol: 0,
             localAddressV6: Buffer.alloc(16),
             longLogicalUnitName: localAddress,
-            operatingSystemUser,
+            operatingSystemUser: localIdentity.operatingSystemUser,
             localAddressV4: Buffer.alloc(4),
             longTransactionProgramName: sessionOptions.applicationServerService,
           },
@@ -961,6 +1031,7 @@ export class DirectCpicSession {
         setup,
         destination,
         programName,
+        localIdentity.hostName,
         cpicStreaming,
         sessionOptions.recursiveSerializerDecisionProvider,
         callbacks,
@@ -1035,7 +1106,7 @@ export class DirectCpicSession {
             : { ticket: options.ticket }),
           language,
           clientAddress: this.#localAddress,
-          partnerHostName: options.partnerHostName ?? hostname(),
+          partnerHostName: options.partnerHostName ?? this.#localHostName,
           destination: this.#destination,
           programName: this.#programName,
           kernelRelease: options.kernelRelease,

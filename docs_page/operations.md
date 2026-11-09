@@ -41,6 +41,39 @@ fallback to root, nobody, or the SAP user occurs. Normal account names keep
 the existing first-12-character initialization value. This requirement does
 not expand the supported Node.js or operating-system matrix.
 
+## Local user and host names
+
+The direct CPIC handshake sends three values taken from the local operating
+system. Their protocol fields accept only printable ASCII (`0x20`–`0x7E`).
+open-rfc reads each value once and checks the part that is sent before it opens
+the gateway connection:
+
+| Value | Sent as | Must be printable ASCII | Failure key |
+|---|---|---|---|
+| OS user name | APPC initialization user | First 12 characters | `RFC_OS_USER_UNSUPPORTED` |
+| Host name | Gateway logical unit (first 8 characters) and CPIC logon partner host (full name) | Full name, 1 to 120 characters | `RFC_LOCAL_HOSTNAME_UNSUPPORTED` |
+
+If the host name cannot be read at all, the key is
+`RFC_LOCAL_HOSTNAME_UNAVAILABLE`. The user-name lookup failure described above
+keeps `RFC_OS_USER_UNAVAILABLE`.
+
+Each of these failures rejects `Client.open()` with
+`codeString: "RFC_ILLEGAL_STATE"` before any gateway connection exists. As
+above, a load-balanced route may already have done Message Server discovery.
+The message is fixed, names the field, and contains neither the local name nor
+its length. open-rfc does not transliterate, substitute, or truncate a name to
+make it sendable, and it does not fall back to `root`, `nobody`, or the SAP
+user. Characters after the 12th in a user name are never sent, so they are not
+checked; ASCII names produce the same wire values as before.
+
+This fails closed because no reference behavior for non-ASCII names is
+known: SAP NW RFC SDK handling of them has not been observed. An invented
+projection would show the gateway an identity that matches no real account.
+Retrying does not help until the environment changes. Run the process under an
+account with an ASCII name and give the host an ASCII name; for a container,
+set an ASCII hostname at start. Windows user names and computer names with
+Korean, accented, or other non-ASCII characters are affected.
+
 ## Pool sizing and shutdown
 
 `resourceOptions.maxConnections` is the hard application-session capacity;
