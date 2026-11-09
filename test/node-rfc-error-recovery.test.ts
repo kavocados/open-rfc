@@ -9,6 +9,7 @@ import {
   ScriptedRfcPeer,
   successfulRegularFields,
 } from "./support/scripted-rfc-peer.js";
+import { generationBoundConsumer } from "./support/generation-bound-consumer.js";
 
 function text(tag: number, value: string): CpicField {
   return { tag, value: Buffer.from(value, "utf16le") };
@@ -79,6 +80,15 @@ async function rejectedCall(client: Client): Promise<RFCError> {
     return error as RFCError;
   }
   assert.fail("expected the RFC call to reject");
+}
+
+async function until(predicate: () => boolean, message: string): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    await nextTurn();
+  }
+  assert.fail(message);
 }
 
 test("compat Client maps rejected and malformed initial logon exactly", async (t) => {
@@ -434,4 +444,165 @@ test("replacement authentication failure preserves the original call error and s
   assert.equal(client.alive, false);
   assert.equal(client.connectionHandle, 0);
   assert.equal(peer.connectionCount, 3);
+});
+
+test("a session workflow refuses stateless clients before opening a connection", () => {
+  const client = new Client({
+    ashost: "application.example.invalid", sysnr: "00", client: "001",
+    user: "SYNTHETIC", passwd: "synthetic-only",
+  }, { stateless: true });
+  assert.throws(
+    () => generationBoundConsumer(client), /session workflow requires a stateful client/u,
+  );
+  assert.equal(client.alive, false);
+  assert.equal(client.connectionHandle, 0);
+});
+
+test("a raw queued call follows replacement despite an admission-time handle check", async (t) => {
+  const peer = await ScriptedRfcPeer.start([
+    { replies: [{ kind: "fields", fields: [
+      text(CpicTag.AbapErrorMessage, "Workflow failure"),
+      text(CpicTag.AbapRuntimeId, "WORKFLOW_FAILED"), end(),
+    ] }] },
+    { replies: [{ kind: "fields", fields: emptyFunctionMetadata() }] },
+    { replies: [{ kind: "fields", fields: successfulRegularFields() }] },
+  ]);
+  t.after(() => peer.close());
+  const client = clientFor(peer);
+  await client.open() as Client;
+  const oldHandle = client.connectionHandle;
+  const first = assert.rejects(client.call("Z_SAME_SESSION", {}), ABAPError);
+  assert.equal(client.connectionHandle, oldHandle);
+  // This check is before dispatch: the previous call still owns the queue.
+  const queued = client.call("Z_SAME_SESSION", {});
+  await Promise.all([first, queued]);
+  assert.notEqual(client.connectionHandle, oldHandle);
+  assert.equal(peer.regularRequestCount(0), 1);
+  assert.equal(peer.regularRequestCount(2), 1);
+  await client.close() as void;
+  await until(() => peer.activeConnectionCount === 0, "client sockets did not close");
+});
+
+test("an exclusive consumer blocks queued old-session work and invalidates verified identity", async (t) => {
+  const peer = await ScriptedRfcPeer.start([
+    { connectionIndex: 7, replies: [
+      { kind: "fields", fields: successfulRegularFields() },
+      { kind: "fields", fields: [
+        text(CpicTag.AbapErrorMessage, "Workflow failure"),
+        text(CpicTag.AbapRuntimeId, "WORKFLOW_FAILED"), end(),
+      ] },
+    ] },
+    { replies: [{ kind: "fields", fields: emptyFunctionMetadata() }] },
+    { connectionIndex: 7, replies: [] },
+  ]);
+  t.after(() => peer.close());
+  const client = clientFor(peer);
+  await client.open() as Client;
+  const workflow = generationBoundConsumer(client);
+  const oldHandle = client.connectionHandle;
+  // Stands in for an application-specific readback, not connectionInfo data.
+  let verifiedIdentity: { generation: number; value: string } | undefined = {
+    generation: oldHandle, value: "synthetic verified identity",
+  };
+  const currentIdentity = (): string | undefined => {
+    if (!workflow.active || verifiedIdentity?.generation !== client.connectionHandle) {
+      verifiedIdentity = undefined;
+    }
+    return verifiedIdentity?.value;
+  };
+  await workflow.call("Z_SAME_SESSION", {});
+  assert.equal(client.connectionHandle, oldHandle);
+  assert.equal(currentIdentity(), "synthetic verified identity");
+  const failure = assert.rejects(workflow.call("Z_SAME_SESSION", {}), ABAPError);
+  const followup = assert.rejects(
+    workflow.call("Z_SAME_SESSION", {}), /session workflow is no longer active/u,
+  );
+  await Promise.all([failure, followup]);
+  assert.equal(client.alive, true);
+  assert.notEqual(client.connectionHandle, oldHandle);
+  assert.equal(workflow.active, false);
+  assert.equal(currentIdentity(), undefined);
+  assert.equal(verifiedIdentity, undefined);
+  assert.equal(peer.regularRequestCount(0), 2);
+  assert.equal(peer.regularRequestCount(2), 0);
+
+  const freshWorkflow = generationBoundConsumer(client);
+  assert.equal(freshWorkflow.active, true);
+  await client.close() as void;
+  assert.equal(freshWorkflow.active, false);
+  assert.equal(client.connectionHandle, 0);
+  assert.equal(client.connectionInfo instanceof Error, true);
+  await assert.rejects(freshWorkflow.call("Z_SAME_SESSION", {}), /no longer active/u);
+  await until(() => peer.activeConnectionCount === 0, "client sockets did not close");
+});
+
+test("timeout and cancellation settle once, discard held replies, and never replay", async (t) => {
+  for (const mode of ["timeout", "cancel"] as const) {
+    await t.test(mode, async () => {
+      const peer = await ScriptedRfcPeer.start([
+        { replies: [{ kind: "held", reply: {
+          kind: "fields", fields: successfulRegularFields(),
+        } }] },
+        { replies: [{ kind: "fields", fields: emptyFunctionMetadata() }] },
+        { replies: [{ kind: "fields", fields: successfulRegularFields() }] },
+      ]);
+      t.after(() => peer.close());
+      const client = clientFor(peer);
+      await client.open() as Client;
+      // Warm metadata before the deliberately short business-call deadline.
+      await client.getFunctionInterface("Z_HELD_REPLY");
+      const oldHandle = client.connectionHandle;
+      let settlements = 0;
+      const outcome = mode === "timeout"
+        ? client.call("Z_HELD_REPLY", {}, { timeout: 0.5 }).then(
+            () => { settlements += 1; return undefined; },
+            (error: unknown) => { settlements += 1; return error; },
+          )
+        : new Promise<unknown>((resolve) => {
+            client.invoke("Z_HELD_REPLY", {}, (error) => {
+              settlements += 1;
+              resolve(error);
+            });
+          });
+      await until(() => peer.regularRequestCount(0) === 1, "business request did not arrive");
+      if (mode === "cancel") await client.cancel() as void;
+      assert.equal(await outcome instanceof RFCError, true);
+      assert.equal(settlements, 1);
+      assert.equal(client.alive, true);
+      assert.notEqual(client.connectionHandle, oldHandle);
+      assert.equal(peer.regularRequestCount(2), 0);
+      await until(() => peer.activeConnectionCount === 2, "old socket was not retired");
+      assert.equal(peer.releaseHeldReply(0), false);
+      await client.call("Z_HELD_REPLY", {});
+      await nextTurn();
+      assert.equal(settlements, 1);
+      assert.equal(peer.regularRequestCount(0), 1);
+      assert.equal(peer.regularRequestCount(2), 1);
+      await client.close() as void;
+      await until(() => peer.activeConnectionCount === 0, "client sockets did not close");
+    });
+  }
+});
+
+test("close cancels an admitted call and rejects queued work without replacement", async (t) => {
+  const peer = await ScriptedRfcPeer.start([
+    { replies: [{ kind: "held", reply: {
+      kind: "fields", fields: successfulRegularFields(),
+    } }] },
+    { replies: [{ kind: "fields", fields: emptyFunctionMetadata() }] },
+  ]);
+  t.after(() => peer.close());
+  const client = clientFor(peer);
+  await client.open() as Client;
+  await client.getFunctionInterface("Z_HELD_CLOSE");
+  const active = assert.rejects(client.call("Z_HELD_CLOSE", {}), RFCError);
+  await until(() => peer.regularRequestCount(0) === 1, "business request did not arrive");
+  const queued = assert.rejects(client.call("Z_HELD_CLOSE", {}), /closed connection/u);
+  await Promise.all([active, queued, client.close()]);
+  assert.equal(client.alive, false);
+  assert.equal(client.connectionHandle, 0);
+  assert.equal(peer.connectionCount, 2);
+  assert.equal(peer.regularRequestCount(0), 1);
+  await until(() => peer.activeConnectionCount === 0, "client sockets did not close");
+  assert.equal(peer.releaseHeldReply(0), false);
 });

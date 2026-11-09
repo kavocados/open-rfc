@@ -768,6 +768,25 @@ export class DirectCpicSession {
     if (typeof transportFactory !== "function") {
       throw new TypeError("transportFactory must be a function");
     }
+    let operatingSystemUser: string;
+    try {
+      operatingSystemUser = short(userInfo().username, 12);
+    } catch {
+      // Resolve the local account before opening a transport. Raw OS errors
+      // can contain host or account data and are not retained as a cause.
+      throw new RfcCoreError(createRfcFailure({
+        category: RfcFailureCategory.InvalidState,
+        origin: RfcFailureOrigin.Api,
+        phase: RfcOperationPhase.Connect,
+        transmission: RfcTransmissionState.NotStarted,
+        establishedSession: false,
+        reasonCode: "RFC_OS_USER_UNAVAILABLE",
+        key: "RFC_OS_USER_UNAVAILABLE",
+        message: "The local operating-system user could not be resolved. " +
+          "Configure a resolvable OS account; containers need a passwd/NSS " +
+          "entry for the runtime UID.",
+      }));
+    }
     const transport = await Reflect.apply(transportFactory, undefined, [
       transportOptions,
       sessionOptions.signal,
@@ -874,7 +893,7 @@ export class DirectCpicSession {
             networkProtocol: 0,
             localAddressV6: Buffer.alloc(16),
             longLogicalUnitName: localAddress,
-            operatingSystemUser: short(userInfo().username, 12),
+            operatingSystemUser,
             localAddressV4: Buffer.alloc(4),
             longTransactionProgramName: sessionOptions.applicationServerService,
           },

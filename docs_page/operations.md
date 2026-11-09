@@ -23,6 +23,24 @@ evaluation and pilot baseline. The application must establish its own
 production readiness through workload, failure, recovery, and operational
 testing.
 
+## Container operating-system account
+
+The process must have a resolvable operating-system account. On Linux, a
+numeric container UID without a passwd/NSS entry makes Node's `os.userInfo()`
+fail. Configure the runtime UID in the image's account database or provide an
+equivalent NSS mapping. Setting `USER`, `LOGNAME`, or the SAP logon user does
+not supply this OS identity.
+
+Before opening the direct CPIC transport, open-rfc resolves the OS username
+used in APPC initialization. Lookup failure rejects `Client.open()` with
+`codeString: "RFC_ILLEGAL_STATE"` and `key: "RFC_OS_USER_UNAVAILABLE"`; the
+application-server transport and business RFC have not started. A
+load-balanced route can already have performed Message Server discovery.
+The error has a fixed local-environment message and retains no raw OS lookup error. No
+fallback to root, nobody, or the SAP user occurs. Normal account names keep
+the existing first-12-character initialization value. This requirement does
+not expand the supported Node.js or operating-system matrix.
+
 ## Pool sizing and shutdown
 
 `resourceOptions.maxConnections` is the hard application-session capacity;
@@ -32,11 +50,40 @@ lookup, so `maxConnections` is not a total physical-session cap. Set
 `maxWaiters` and `acquireTimeoutMs` so an unhealthy backend cannot turn into an
 unbounded application queue.
 
+For the current direct classic topology, reserve these separate capacities:
+
+| Owner | Application lane | Metadata repository lane | Total CPIC session slots |
+|---|---:|---:|---:|
+| Standalone `Client` | 1 | 1 | 2 |
+| Shared `Pool`, application limit `N` | `N` | `min(2, N)` | `N + min(2, N)` |
+
+The repository lane opens on demand. A warm metadata cache can avoid new
+lookups, but its idle connections remain owned until retirement. Pool clients
+share that lane and cache; they do not each own two connections. Route discovery
+and proxy infrastructure are outside this direct CPIC session-slot calculation.
+
+Use `pool.monitor().applicationPool` and `.repositoryPool` separately. For each
+lane, `connections` includes `idle`, `leased`, `creating`, `validating`,
+`resetting`, and `closing`. `waiting` counts acquisition requests, not sockets.
+Sum both lanes when comparing capacity with independent socket measurements.
+Compare at settled barriers: a creating slot can precede the remote accept,
+and the peer's close event can lag local retirement. These transient differences
+do not justify increasing the application limit or discarding closing records.
+Standalone Client has lifecycle diagnostics but no public pool monitor; use an
+independent connection observation when checking its two-slot topology.
+
 On shutdown, stop accepting new application work, wait for owned work within
 its business deadline, then call `pool.closeAll()`. Do not reuse a wrapper that
 was leased before shutdown. A failed or timed-out shutdown should terminate the
 process through the application's ordinary supervisor rather than leave an
 unknown session running indefinitely.
+
+After successful shutdown, both lanes' connection and waiter counts converge
+to zero. A failed or timed-out destroy deliberately retains unresolved closing
+resources in the monitor and rejects shutdown. Do not reset those counters or
+report zero resources solely because admission has stopped. Counters and fixed
+diagnostic codes are sufficient for these checks; no endpoint, principal,
+credential, or RFC payload belongs in capacity telemetry.
 
 ## Retry decisions
 

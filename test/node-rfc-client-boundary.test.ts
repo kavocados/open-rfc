@@ -1087,6 +1087,71 @@ test("managed-client attachment and claim transfer one opaque lease exactly once
   );
 });
 
+test("connectionInfo distinguishes configured routes, negotiation, constants, and unavailable fields", async () => {
+  for (const selected of [false, true]) {
+    const lease = Object.freeze({}) as DirectDestinationApplicationLease;
+    const owner = {
+      async acquireApplication() { return lease; },
+      async applicationInfo() {
+        return Object.freeze({
+          localAddress: "192.0.2.10",
+          peerCodePage: "fixture-negotiated-codepage",
+          peerAcceptInfo: 0,
+          generationHandle: 51,
+          connectionIndex: 3,
+          ...(selected ? {
+            selectedApplicationServerHost: "selected.application.invalid",
+            selectedGatewayHost: "selected.gateway.invalid",
+            selectedSystemNumber: "42",
+          } : {}),
+        });
+      },
+      async releaseApplication() {},
+      async retire() {},
+    } as unknown as DirectDestinationOwner;
+    const restore = bindClientDestinationOwnerFactory({ create: () => owner });
+    const client = new Client({ ...parameters, gwhost: "configured.gateway.invalid" });
+    try {
+      assert.equal(client.connectionInfo instanceof Error, true);
+      await client.open() as Client;
+      const info = client.connectionInfo;
+      assert.equal(Object.isFrozen(info), true);
+      assert.deepEqual(info, {
+        dest: "",
+        host: selected ? "selected.application.invalid" : parameters.ashost,
+        partnerHost: selected ? "selected.application.invalid" : parameters.ashost,
+        sysNumber: selected ? "42" : parameters.sysnr,
+        sysId: "",
+        client: parameters.client,
+        user: parameters.user,
+        language: "E",
+        trace: "0",
+        isoLanguage: "EN",
+        codepage: "4103",
+        partnerCodepage: "fixture-negotiated-codepage",
+        rfcRole: "C",
+        type: "3",
+        partnerType: "3",
+        rel: "",
+        partnerRel: "",
+        kernelRel: "",
+        cpicConvId: "",
+        progName: "open-rfc",
+        partnerBytesPerChar: "2",
+        partnerSystemCodepage: "fixture-negotiated-codepage",
+        partnerIP: selected ? "selected.gateway.invalid" : "configured.gateway.invalid",
+        partnerIPv6: "",
+      });
+      await client.close() as void;
+      assert.equal(client.connectionInfo instanceof Error, true);
+      // Previously returned snapshots stay immutable; consumers must invalidate them.
+      assert.equal((info as Record<string, string>).user, parameters.user);
+    } finally {
+      restore();
+    }
+  }
+});
+
 test("pool configuration and overload validation is complete before owner creation", async () => {
   for (const configuration of [null, undefined, []]) {
     assert.throws(
