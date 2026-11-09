@@ -7,6 +7,8 @@ import {
   CpicLogonError,
   DirectCpicPreWireError,
   type DirectCpicSessionInfo,
+  type RfcLocalIdentity,
+  snapshotRfcLocalIdentity,
 } from "../client/direct-cpic-session.js";
 import {
   ABAPError,
@@ -88,6 +90,11 @@ export interface RfcClientOptions {
   readonly recursiveSerializerPolicy?: LiveRecursiveSerializerPolicy;
   /** open-rfc preview: raw synchronous DESTINATION 'BACK' handlers by FM name. */
   readonly callbacks?: RfcCallbackHandlers;
+  /**
+   * open-rfc extension: explicit ASCII OS user and host name sent during the
+   * direct CPIC handshake instead of `os.userInfo()` / `os.hostname()`.
+   */
+  readonly localIdentity?: RfcLocalIdentity;
 }
 
 export interface RfcCallOptions {
@@ -358,6 +365,7 @@ const RFC_CLIENT_OPTION_NAMES = Object.freeze([
   "diagnostics",
   "recursiveSerializerPolicy",
   "callbacks",
+  "localIdentity",
 ] as const);
 const RFC_CLIENT_OPTION_KEYS = new Set<string>(RFC_CLIENT_OPTION_NAMES);
 
@@ -402,6 +410,7 @@ export function snapshotRfcClientOptions(
     diagnostics?: RfcDiagnosticEmitter;
     recursiveSerializerPolicy?: LiveRecursiveSerializerPolicy;
     callbacks?: RfcCallbackHandlers;
+    localIdentity?: RfcLocalIdentity;
   } = {};
   for (const name of RFC_CLIENT_OPTION_NAMES) {
     const captured = ownDataValue(input, name, "clientOptions");
@@ -415,7 +424,8 @@ export function snapshotRfcClientOptions(
         name === "int8Mode" ||
         name === "diagnostics" ||
         name === "recursiveSerializerPolicy" ||
-        name === "callbacks"
+        name === "callbacks" ||
+        name === "localIdentity"
       ) &&
       captured.value === undefined
     ) continue;
@@ -438,7 +448,12 @@ export function snapshotRfcClientOptions(
               ))
             : name === "int8Mode"
               ? snapshotClassicInt8Mode(captured.value, "clientOptions.int8Mode")
-              : captured.value,
+              : name === "localIdentity"
+                ? snapshotRfcLocalIdentity(
+                    captured.value,
+                    "clientOptions.localIdentity",
+                  )
+                : captured.value,
       enumerable: true,
       configurable: false,
       writable: false,
@@ -485,11 +500,17 @@ export function directSessionOptionsFromRfcClientOptions(
 ): DirectDestinationSessionOptions | undefined {
   const recursiveSerializerPolicy = options?.recursiveSerializerPolicy;
   const callbacks = options?.callbacks;
-  if (recursiveSerializerPolicy === undefined && callbacks === undefined) {
+  const localIdentity = options?.localIdentity;
+  if (
+    recursiveSerializerPolicy === undefined &&
+    callbacks === undefined &&
+    localIdentity === undefined
+  ) {
     return undefined;
   }
   return Object.freeze({
     ...(callbacks === undefined ? {} : { callbacks }),
+    ...(localIdentity === undefined ? {} : { localIdentity }),
     ...(recursiveSerializerPolicy === undefined
       ? {}
       : {

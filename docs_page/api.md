@@ -176,6 +176,7 @@ and becomes terminal after an ambiguous failure.
 | `clientOptions.diagnostics` | Optional bounded structured diagnostic emitter. Never emit RFC inputs, outputs, or credentials from application wrappers. |
 | `clientOptions.recursiveSerializerPolicy` | Advanced open-rfc extension for recursive (nested table or structure) sends. Shape: `{ profile, observation: { defaultSerializer, basxmlDisabledSerializer } }`, where `profile` is `"abap-7.50"` or `"abap-7.58"`, `defaultSerializer` is `"classic-xrfc"`, `"basxml"` or `"unsupported"`, and `basxmlDisabledSerializer` is `"classic-xrfc"` or `"unsupported"`. Omit it unless the exact artifact's published support record supports the selected partner and value graph. Without a policy, recursive calls use classic xRFC only when function metadata explicitly says basXML is unsupported; basXML-capable or unknown functions fail closed. |
 | `clientOptions.callbacks` | Preview handlers for server-initiated `DESTINATION 'BACK'` calls, keyed by exact RFM name. A handler receives owned raw classic-RFC values plus `{ callbackIndex, signal }` and must synchronously return a plain own-data `{ exports?, tables?, xrfcParameters? }` or `{ exception }` response. Returned parameter names must be present in `request.requestedOutputs`; each raw xRFC result name must match its XML root. Unknown callback RFMs receive `FU_NOT_FOUND`; malformed, unconfigured, asynchronous, or excessive callback activity fails closed. |
+| `clientOptions.localIdentity` | open-rfc extension: `{ osUser?, hostname? }` sent during the direct CPIC handshake instead of `os.userInfo().username` and `os.hostname()`. `osUser` is 1..12 and `hostname` 1..120 visible ASCII characters; invalid values are rejected at construction, never truncated. Each supplied field replaces its lookup; an omitted field keeps the fail-closed OS lookup. See [Local user and host names](operations.md#local-user-and-host-names). |
 
 `cancel()` signals active calls and resolves after signaling; await the original
 call promise or callback for its terminal outcome. A timeout or cancellation is
@@ -364,8 +365,8 @@ supported way to abort and join active connection operations.
 operationally sensitive route and user identity. The optional constructor
 logger has a `log(type, ...args)` method; open-rfc sends it only fixed lifecycle
 messages. `RFCClient` configuration accepts the same advanced
-`recursiveSerializerPolicy` and raw synchronous `callbacks` preview described
-for `Client` above.
+`recursiveSerializerPolicy`, raw synchronous `callbacks` preview, and
+`localIdentity` described for `Client` above.
 
 `execute()` accepts direction-specific `import`, `changing`, and `table`
 buckets. A parameter may appear in only one bucket. Validation is enabled by

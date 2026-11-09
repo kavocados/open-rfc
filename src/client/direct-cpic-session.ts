@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { isIPv4 } from "node:net";
+import { types as nodeUtilTypes } from "node:util";
 
 import {
   APPC_FINAL_SAP_PARAMETER_LENGTH,
@@ -169,6 +170,86 @@ export interface DirectCpicSessionOptions {
   readonly recursiveSerializerDecisionProvider?: RecursiveSerializerDecisionProvider;
   /** Raw synchronous handlers for server-initiated DESTINATION 'BACK' calls. */
   readonly callbacks?: RfcCallbackHandlers;
+  /** Explicit local OS identity; each field replaces its OS lookup. */
+  readonly localIdentity?: RfcLocalIdentity;
+}
+
+/**
+ * open-rfc extension: explicit local identity sent during the direct CPIC
+ * handshake. Each supplied field replaces its operating-system lookup
+ * unconditionally; an omitted field keeps the lookup and its validation.
+ * SAP sees these values as the client's OS user and terminal host, so they
+ * should identify the process truthfully.
+ */
+export interface RfcLocalIdentity {
+  /**
+   * Replaces `os.userInfo().username` in APPC initialization. 1..12 visible
+   * ASCII characters (`0x21`-`0x7E`); longer values are rejected, not cut.
+   */
+  readonly osUser?: string;
+  /**
+   * Replaces `os.hostname()`. 1..120 visible ASCII characters; the CPIC
+   * logon sends the full value and the gateway record its first 8.
+   */
+  readonly hostname?: string;
+}
+
+const LOCAL_IDENTITY_FIELDS = Object.freeze({
+  osUser: 12,
+  hostname: 120,
+} as const);
+
+/**
+ * Validate and freeze an explicit local identity. Only own data properties are
+ * inspected, so accessors never run; values are never echoed in errors.
+ */
+export function snapshotRfcLocalIdentity(
+  input: unknown,
+  path: string,
+): RfcLocalIdentity | undefined {
+  if (input === undefined) return undefined;
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    Array.isArray(input) ||
+    nodeUtilTypes.isProxy(input) ||
+    (
+      Object.getPrototypeOf(input) !== Object.prototype &&
+      Object.getPrototypeOf(input) !== null
+    )
+  ) {
+    throw new TypeError(`${path} must be a plain object`);
+  }
+  const values: Partial<Record<keyof typeof LOCAL_IDENTITY_FIELDS, unknown>> = {};
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== "string") {
+      throw new TypeError(`${path} keys must be strings`);
+    }
+    if (!Object.hasOwn(LOCAL_IDENTITY_FIELDS, key)) {
+      throw new TypeError(`unknown ${path} property ${key}`);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(input, key)!;
+    if (!("value" in descriptor)) {
+      throw new TypeError(`${path}.${key} must be an own data property`);
+    }
+    values[key as keyof typeof LOCAL_IDENTITY_FIELDS] = descriptor.value;
+  }
+  const snapshot: { osUser?: string; hostname?: string } = {};
+  for (const [field, maximum] of Object.entries(LOCAL_IDENTITY_FIELDS) as
+    [keyof typeof LOCAL_IDENTITY_FIELDS, number][]) {
+    const value = values[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string") {
+      throw new TypeError(`${path}.${field} must be a string`);
+    }
+    if (value.length > maximum || !/^[\x21-\x7e]+$/u.test(value)) {
+      throw new RangeError(
+        `${path}.${field} must contain 1..${maximum} visible ASCII characters`,
+      );
+    }
+    snapshot[field] = value;
+  }
+  return Object.freeze(snapshot);
 }
 
 /**
@@ -642,9 +723,18 @@ function localEnvironmentFailure(
  * Resolve and validate every OS-derived gateway, APPC, and CPIC logon value
  * before a transport exists. The protocol encoders accept printable ASCII
  * only, and no SDK-equivalent projection for other names is known, so an
- * unsendable value fails closed instead of being substituted.
+ * unsendable value fails closed instead of being substituted. An explicit,
+ * already validated override replaces its lookup entirely.
  */
-function resolveLocalWireIdentity(): LocalWireIdentity {
+function resolveLocalWireIdentity(
+  override: RfcLocalIdentity | undefined,
+): LocalWireIdentity {
+  const operatingSystemUser = override?.osUser ?? resolveOperatingSystemUser();
+  const hostName = override?.hostname ?? resolveHostName();
+  return Object.freeze({ operatingSystemUser, hostName });
+}
+
+function resolveOperatingSystemUser(): string {
   let operatingSystemUser: string;
   try {
     const username: unknown = userInfo().username;
@@ -654,8 +744,8 @@ function resolveLocalWireIdentity(): LocalWireIdentity {
     throw localEnvironmentFailure(
       "RFC_OS_USER_UNAVAILABLE",
       "The local operating-system user could not be resolved. " +
-        "Configure a resolvable OS account; containers need a passwd/NSS " +
-        "entry for the runtime UID.",
+        "Configure a resolvable OS account (containers need a passwd/NSS " +
+        "entry for the runtime UID) or set an explicit localIdentity.osUser.",
     );
   }
   if (!PRINTABLE_ASCII.test(operatingSystemUser)) {
@@ -663,9 +753,14 @@ function resolveLocalWireIdentity(): LocalWireIdentity {
       "RFC_OS_USER_UNSUPPORTED",
       "The local operating-system user name cannot be sent: APPC " +
         "initialization needs its first 12 characters to be printable " +
-        "ASCII. Run the process under an account with an ASCII name.",
+        "ASCII. Run the process under an account with an ASCII name or " +
+        "set an explicit localIdentity.osUser.",
     );
   }
+  return operatingSystemUser;
+}
+
+function resolveHostName(): string {
   let hostName: string;
   try {
     const resolved: unknown = hostname();
@@ -675,7 +770,7 @@ function resolveLocalWireIdentity(): LocalWireIdentity {
     throw localEnvironmentFailure(
       "RFC_LOCAL_HOSTNAME_UNAVAILABLE",
       "The local host name could not be resolved. Configure a resolvable " +
-        "host name for the runtime environment.",
+        "host name or set an explicit localIdentity.hostname.",
     );
   }
   if (
@@ -687,10 +782,10 @@ function resolveLocalWireIdentity(): LocalWireIdentity {
       "RFC_LOCAL_HOSTNAME_UNSUPPORTED",
       "The local host name cannot be sent: the gateway and CPIC logon " +
         "records need 1..120 printable ASCII characters. Configure an " +
-        "ASCII host name.",
+        "ASCII host name or set an explicit localIdentity.hostname.",
     );
   }
-  return Object.freeze({ operatingSystemUser, hostName });
+  return hostName;
 }
 
 function gatewayIpv4(address: string | undefined): string | undefined {
@@ -759,6 +854,10 @@ function snapshotSessionOptions(
     recursiveSerializerDecisionProvider:
       options.recursiveSerializerDecisionProvider,
     callbacks: options.callbacks,
+    localIdentity: snapshotRfcLocalIdentity(
+      options.localIdentity,
+      "direct CPIC session localIdentity",
+    ),
   });
   validateSessionOptions(snapshot);
   return snapshot;
@@ -856,7 +955,9 @@ export class DirectCpicSession {
       throw new TypeError("transportFactory must be a function");
     }
     // Fail on the local environment before any gateway connection exists.
-    const localIdentity = resolveLocalWireIdentity();
+    const localIdentity = resolveLocalWireIdentity(
+      sessionOptions.localIdentity,
+    );
     const transport = await Reflect.apply(transportFactory, undefined, [
       transportOptions,
       sessionOptions.signal,

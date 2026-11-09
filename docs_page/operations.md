@@ -28,8 +28,9 @@ testing.
 The process must have a resolvable operating-system account. On Linux, a
 numeric container UID without a passwd/NSS entry makes Node's `os.userInfo()`
 fail. Configure the runtime UID in the image's account database or provide an
-equivalent NSS mapping. Setting `USER`, `LOGNAME`, or the SAP logon user does
-not supply this OS identity.
+equivalent NSS mapping, or set an explicit
+[`localIdentity.osUser`](#explicit-local-identity). Setting `USER`, `LOGNAME`,
+or the SAP logon user does not supply this OS identity.
 
 Before opening the direct CPIC transport, open-rfc resolves the OS username
 used in APPC initialization. Lookup failure rejects `Client.open()` with
@@ -72,7 +73,46 @@ projection would show the gateway an identity that matches no real account.
 Retrying does not help until the environment changes. Run the process under an
 account with an ASCII name and give the host an ASCII name; for a container,
 set an ASCII hostname at start. Windows user names and computer names with
-Korean, accented, or other non-ASCII characters are affected.
+Korean, accented, or other non-ASCII characters are affected. If the
+environment cannot change, supply the values explicitly.
+
+### Explicit local identity
+
+`clientOptions.localIdentity` (for `Client` and `Pool`) and the
+`localIdentity` property of the `RFCClient` configuration replace the OS
+lookups with values you choose:
+
+```ts
+const client = new Client(connectionParameters, {
+  localIdentity: { osUser: "hong", hostname: "hong-pc" },
+});
+```
+
+| Field | Replaces | Rule |
+|---|---|---|
+| `osUser` | `os.userInfo().username` | 1 to 12 visible ASCII characters (`0x21`–`0x7E`) |
+| `hostname` | `os.hostname()` | 1 to 120 visible ASCII characters |
+
+- Each field is independent. A supplied field always replaces its lookup, even
+  when the OS value would be sendable; that lookup does not run, so
+  `osUser` also covers a container UID without a passwd entry. An omitted field
+  keeps the lookup and the fail-closed rules above.
+- Values are sent as given. A longer or otherwise invalid value is rejected
+  when the client is constructed, not truncated, and the error does not
+  repeat the value. Spaces are rejected because these fields are
+  space-padded on the wire.
+- The gateway logical unit is the first 8 characters of `hostname`, as it is
+  for an OS host name; the CPIC logon carries the full value.
+- An empty object, or a field set to `undefined`, configures no override.
+  Unknown properties and accessors are rejected.
+
+SAP records these values as the client's OS user and terminal host. Choose
+values that truthfully identify the process and machine, such as an ASCII
+alias that your operators can map back to the real account and host.
+
+The override is a client option, like the other open-rfc extensions, rather
+than a connection parameter. Connection parameters mirror SAP NW RFC SDK
+names, and no SDK equivalent for these values is known.
 
 ## Pool sizing and shutdown
 

@@ -66,6 +66,10 @@ import {
   snapshotRfcCallbackHandlers,
   type RfcCallbackHandlers,
 } from "../protocol/rfc-callback.js";
+import {
+  snapshotRfcLocalIdentity,
+  type RfcLocalIdentity,
+} from "../client/direct-cpic-session.js";
 
 export interface RFCInputParams {
   readonly import?: RfcObject;
@@ -82,6 +86,11 @@ export interface RFCClientConfiguration {
   readonly recursiveSerializerPolicy?: LiveRecursiveSerializerPolicy;
   /** open-rfc preview: raw synchronous DESTINATION 'BACK' handlers by FM name. */
   readonly callbacks?: RfcCallbackHandlers;
+  /**
+   * open-rfc extension: explicit ASCII OS user and host name sent during the
+   * direct CPIC handshake instead of `os.userInfo()` / `os.hostname()`.
+   */
+  readonly localIdentity?: RfcLocalIdentity;
 }
 
 function snapshotRFCClientConfiguration(
@@ -90,7 +99,11 @@ function snapshotRFCClientConfiguration(
   if (input === undefined) return undefined;
   plainRecord(input, "RFCClient configuration");
   for (const key of Reflect.ownKeys(input)) {
-    if (key !== "recursiveSerializerPolicy" && key !== "callbacks") {
+    if (
+      key !== "recursiveSerializerPolicy" &&
+      key !== "callbacks" &&
+      key !== "localIdentity"
+    ) {
       throw new TypeError("unknown RFCClient configuration property");
     }
   }
@@ -99,6 +112,18 @@ function snapshotRFCClientConfiguration(
     "recursiveSerializerPolicy",
   );
   const callbacksDescriptor = Object.getOwnPropertyDescriptor(input, "callbacks");
+  const localIdentityDescriptor = Object.getOwnPropertyDescriptor(
+    input,
+    "localIdentity",
+  );
+  if (
+    localIdentityDescriptor !== undefined &&
+    !("value" in localIdentityDescriptor)
+  ) {
+    throw new TypeError(
+      "RFCClient configuration localIdentity must be an own data property",
+    );
+  }
   if (
     recursiveDescriptor !== undefined &&
     !("value" in recursiveDescriptor)
@@ -128,11 +153,16 @@ function snapshotRFCClientConfiguration(
           "RFCClient configuration callbacks",
         )!,
       ));
+  const localIdentity = snapshotRfcLocalIdentity(
+    localIdentityDescriptor?.value,
+    "RFCClient configuration localIdentity",
+  );
   return Object.freeze({
     ...(recursiveSerializerPolicy === undefined
       ? {}
       : { recursiveSerializerPolicy }),
     ...(callbacks === undefined ? {} : { callbacks }),
+    ...(localIdentity === undefined ? {} : { localIdentity }),
   });
 }
 
@@ -951,8 +981,11 @@ export class RFCClient {
     const recursiveSerializerPolicy =
       capturedConfiguration?.recursiveSerializerPolicy;
     const callbacks = capturedConfiguration?.callbacks;
+    const localIdentity = capturedConfiguration?.localIdentity;
     const ownerFactory: RFCClientDestinationOwnerFactory =
-      recursiveSerializerPolicy === undefined && callbacks === undefined
+      recursiveSerializerPolicy === undefined &&
+        callbacks === undefined &&
+        localIdentity === undefined
         ? productionOwnerFactory
         : (connection, context) => createProductionOwner({
             connection,
@@ -960,6 +993,7 @@ export class RFCClient {
             session: Object.freeze({
               ...(context?.session ?? {}),
               ...(callbacks === undefined ? {} : { callbacks }),
+              ...(localIdentity === undefined ? {} : { localIdentity }),
               ...(recursiveSerializerPolicy === undefined
                 ? {}
                 : {

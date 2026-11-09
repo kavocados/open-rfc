@@ -3,7 +3,7 @@ import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import test, { type TestContext } from "node:test";
 
-import { Client, RFCError } from "../src/index.js";
+import { Client, Pool, RFCClient, RFCError } from "../src/index.js";
 import { DirectCpicSession } from "../src/client/direct-cpic-session.js";
 import {
   RfcCoreError,
@@ -31,16 +31,19 @@ interface LocalIdentity {
   readonly hostname: string;
 }
 
-function mockLocalIdentity(t: TestContext, identity: LocalIdentity): void {
-  t.mock.method(os, "userInfo", (() => ({
-    username: identity.username,
-    uid: 1000,
-    gid: 1000,
-    shell: null,
-    homedir: "/home/synthetic",
-  })) as typeof os.userInfo);
-  t.mock.method(os, "hostname", () => identity.hostname);
+function mockLocalIdentity(t: TestContext, identity: LocalIdentity) {
+  const lookups = {
+    userInfo: t.mock.method(os, "userInfo", (() => ({
+      username: identity.username,
+      uid: 1000,
+      gid: 1000,
+      shell: null,
+      homedir: "/home/synthetic",
+    })) as typeof os.userInfo),
+    hostname: t.mock.method(os, "hostname", () => identity.hostname),
+  };
   syncBuiltinESMExports();
+  return lookups;
 }
 
 function restoreLocalIdentity(t: TestContext): void {
@@ -247,6 +250,7 @@ async function startPartnerHostPeer(t: TestContext): Promise<{
       ).fields.find(({ tag }) => tag === CpicTag.PartnerHost);
       partnerHost = field?.value.toString("ascii");
     },
+    replies: [{ kind: "fields", fields: successfulRegularFields() }],
   }]);
   t.after(() => peer.close());
   return { peer, partnerHost: () => partnerHost };
@@ -320,4 +324,274 @@ test("CPIC logon reuses the host name validated before transport creation", asyn
   } finally {
     await session?.close();
   }
+});
+
+// Explicit caller-supplied local identity (open-rfc extension). Each field
+// replaces its OS lookup unconditionally; an omitted field keeps the lookup
+// and its fail-closed validation.
+
+const nonAsciiIdentity = { username: "홍길동", hostname: "홍길동-PC" } as const;
+
+function clientParameters(peer: ScriptedRfcPeer) {
+  return {
+    ashost: "application.example.test",
+    gwhost: "127.0.0.1",
+    gwserv: `${peer.port}`,
+    sysnr: "00",
+    client: "001",
+    user: "RFCUSR",
+    passwd: "synthetic-password",
+  };
+}
+
+async function startClientPeer(t: TestContext): Promise<ScriptedRfcPeer> {
+  const peer = await ScriptedRfcPeer.start([{
+    replies: [{ kind: "fields", fields: successfulRegularFields() }],
+  }]);
+  t.after(() => peer.close());
+  return peer;
+}
+
+test("direct session sends explicit localIdentity values without OS lookups", async (t) => {
+  const { peer, partnerHost } = await startPartnerHostPeer(t);
+  const sent: Buffer[] = [];
+  let session: DirectCpicSession | undefined;
+  try {
+    const lookups = mockLocalIdentity(t, nonAsciiIdentity);
+    try {
+      session = await DirectCpicSession.open({
+        host: "127.0.0.1",
+        port: peer.port,
+        applicationServerService: "sapdp00",
+        transportFactory: recordingTransportFactory(sent),
+        localIdentity: {
+          osUser: "svc-rfc",
+          hostname: "rfc-host-01.example.test",
+        },
+      });
+      await session.logonAndPing(logon);
+      assert.equal(lookups.userInfo.mock.callCount(), 0);
+      assert.equal(lookups.hostname.mock.callCount(), 0);
+    } finally {
+      restoreLocalIdentity(t);
+    }
+    // The gateway logical unit is the protocol's first-8-character field of
+    // the explicit host name; the CPIC logon carries the full value.
+    assert.equal(decodeGatewayNormalClient(sent[0]!).logicalUnit, "rfc-host");
+    const initialize = sent[1]!;
+    assert.equal(
+      decodeAppcInitializeParameters(initialize.subarray(
+        initialize.byteLength - APPC_INITIALIZE_PARAMETERS_LENGTH,
+      )).options.operatingSystemUser,
+      "svc-rfc",
+    );
+    assert.equal(partnerHost(), "rfc-host-01.example.test");
+  } finally {
+    await session?.close();
+  }
+});
+
+test("Client localIdentity replaces both OS lookups through the logon", async (t) => {
+  const { peer, partnerHost } = await startPartnerHostPeer(t);
+  const lookups = mockLocalIdentity(t, nonAsciiIdentity);
+  const client = new Client(clientParameters(peer), {
+    localIdentity: { osUser: "hong", hostname: "hong-pc" },
+  });
+  try {
+    await client.open();
+    assert.equal(client.alive, true);
+    assert.equal(peer.connectionCount, 1);
+    assert.equal(partnerHost(), "hong-pc");
+    assert.equal(lookups.userInfo.mock.callCount(), 0);
+    assert.equal(lookups.hostname.mock.callCount(), 0);
+  } finally {
+    restoreLocalIdentity(t);
+    if (client.alive) await client.close();
+  }
+});
+
+test("Client localIdentity.osUser skips an unavailable OS account lookup", async (t) => {
+  const peer = await startClientPeer(t);
+  const lookup = t.mock.method(os, "userInfo", () => {
+    throw new Error("private-os-lookup-detail");
+  });
+  t.mock.method(os, "hostname", () => "hong-pc");
+  syncBuiltinESMExports();
+  const client = new Client(clientParameters(peer), {
+    localIdentity: { osUser: "svc-rfc" },
+  });
+  try {
+    await client.open();
+    assert.equal(client.alive, true);
+    assert.equal(peer.connectionCount, 1);
+    assert.equal(lookup.mock.callCount(), 0);
+  } finally {
+    restoreLocalIdentity(t);
+    if (client.alive) await client.close();
+  }
+});
+
+for (const partial of [
+  {
+    name: "only an OS-user override",
+    localIdentity: { osUser: "hong" },
+    key: "RFC_LOCAL_HOSTNAME_UNSUPPORTED",
+  },
+  {
+    name: "only a host-name override",
+    localIdentity: { hostname: "hong-pc" },
+    key: "RFC_OS_USER_UNSUPPORTED",
+  },
+  {
+    name: "an empty override",
+    localIdentity: {},
+    key: "RFC_OS_USER_UNSUPPORTED",
+  },
+  {
+    name: "explicitly undefined override fields",
+    localIdentity: { osUser: undefined, hostname: undefined },
+    key: "RFC_OS_USER_UNSUPPORTED",
+  },
+] as const) {
+  test(`Client with ${partial.name} still validates the remaining OS values`, async (t) => {
+    const peer = await startClientPeer(t);
+    mockLocalIdentity(t, nonAsciiIdentity);
+    const client = new Client(clientParameters(peer), {
+      localIdentity: partial.localIdentity,
+    });
+    try {
+      await assert.rejects(client.open() as Promise<Client>, (error: unknown) => {
+        assert.ok(error instanceof RFCError, String(error));
+        assert.equal(error.codeString, "RFC_ILLEGAL_STATE");
+        assert.equal(error.key, partial.key);
+        return true;
+      });
+      assert.equal(client.alive, false);
+      assert.equal(peer.connectionCount, 0);
+    } finally {
+      restoreLocalIdentity(t);
+    }
+  });
+}
+
+const invalidOverrideValues = [
+  { name: "an OS user with a space", value: { osUser: "hong lee" }, field: "osUser" },
+  { name: "a 13-character OS user", value: { osUser: "abcdefghijklm" }, field: "osUser" },
+  { name: "an empty OS user", value: { osUser: "" }, field: "osUser" },
+  { name: "a non-ASCII OS user", value: { osUser: "홍길동" }, field: "osUser" },
+  { name: "a non-ASCII host name", value: { hostname: "홍길동-PC" }, field: "hostname" },
+  { name: "a host name with a space", value: { hostname: "my host" }, field: "hostname" },
+  { name: "an empty host name", value: { hostname: "" }, field: "hostname" },
+  {
+    name: "a 121-character host name",
+    value: { hostname: `h${"x".repeat(120)}` },
+    field: "hostname",
+  },
+] as const;
+
+for (const invalid of invalidOverrideValues) {
+  test(`Client construction rejects ${invalid.name} in localIdentity`, async (t) => {
+    const peer = await startClientPeer(t);
+    const raw = Object.values(invalid.value)[0]!;
+    assert.throws(
+      () => new Client(clientParameters(peer), { localIdentity: invalid.value }),
+      (error: unknown) => {
+        assert.ok(error instanceof RangeError, String(error));
+        assert.match(
+          error.message,
+          new RegExp(`^clientOptions\\.localIdentity\\.${invalid.field} must contain `, "u"),
+        );
+        if (raw.length > 0) assert.equal(error.message.includes(raw), false);
+        return true;
+      },
+    );
+    assert.equal(peer.connectionCount, 0);
+  });
+}
+
+test("localIdentity shape errors fail at construction without reading accessors", async (t) => {
+  const peer = await startClientPeer(t);
+  const parameters = clientParameters(peer);
+  assert.throws(
+    () => new Client(parameters, { localIdentity: "hong" as never }),
+    /^TypeError: clientOptions\.localIdentity must be a plain object$/u,
+  );
+  assert.throws(
+    () => new Client(parameters, { localIdentity: [] as never }),
+    /^TypeError: clientOptions\.localIdentity must be a plain object$/u,
+  );
+  assert.throws(
+    () => new Client(parameters, { localIdentity: { osUser: 7 } as never }),
+    /^TypeError: clientOptions\.localIdentity\.osUser must be a string$/u,
+  );
+  assert.throws(
+    () => new Client(parameters, { localIdentity: { user: "hong" } as never }),
+    /^TypeError: unknown clientOptions\.localIdentity property user$/u,
+  );
+  let reads = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "osUser", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "hong";
+    },
+  });
+  assert.throws(
+    () => new Client(parameters, { localIdentity: accessor }),
+    /^TypeError: clientOptions\.localIdentity\.osUser must be an own data property$/u,
+  );
+  assert.equal(reads, 0);
+  assert.equal(peer.connectionCount, 0);
+});
+
+test("Pool clientOptions.localIdentity reaches pooled sessions", async (t) => {
+  const peer = await startClientPeer(t);
+  mockLocalIdentity(t, nonAsciiIdentity);
+  const pool = new Pool({
+    connectionParameters: clientParameters(peer),
+    clientOptions: { localIdentity: { osUser: "hong", hostname: "hong-pc" } },
+    poolOptions: { low: 0, high: 1 },
+  });
+  try {
+    const client = await pool.acquire() as Client;
+    assert.equal(client.alive, true);
+    assert.equal(peer.connectionCount, 1);
+  } finally {
+    restoreLocalIdentity(t);
+    await pool.closeAll();
+  }
+});
+
+test("RFCClient configuration localIdentity reaches its sessions", async (t) => {
+  // Both OS values are unsendable. Only the explicit OS user reaches the
+  // session, so the rejection moves from the user to the host-name key
+  // before any connection is made.
+  const peer = await startClientPeer(t);
+  mockLocalIdentity(t, nonAsciiIdentity);
+  const client = new RFCClient(undefined, {
+    localIdentity: { osUser: "hong" },
+  });
+  try {
+    await assert.rejects(client.open(clientParameters(peer)), (error: unknown) => {
+      assert.ok(error instanceof RFCError, String(error));
+      assert.equal(error.codeString, "RFC_ILLEGAL_STATE");
+      assert.equal(error.key, "RFC_LOCAL_HOSTNAME_UNSUPPORTED");
+      return true;
+    });
+    assert.equal(peer.connectionCount, 0);
+  } finally {
+    restoreLocalIdentity(t);
+  }
+});
+
+test("RFCClient configuration rejects an invalid localIdentity", () => {
+  assert.throws(
+    () => new RFCClient(undefined, { localIdentity: { osUser: "hong lee" } }),
+    /^RangeError: RFCClient configuration localIdentity\.osUser must contain /u,
+  );
+  assert.throws(
+    () => new RFCClient(undefined, { localIdentity: { user: "hong" } as never }),
+    /^TypeError: unknown RFCClient configuration localIdentity property user$/u,
+  );
 });

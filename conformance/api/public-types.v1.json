@@ -52,8 +52,8 @@
     },
     {
       "path": "dist/src/client/direct-cpic-session.d.ts",
-      "bytes": 9899,
-      "sha256": "2ef89cd701de5c1fad55bb88e6acdb888d183fd1bbdf2d7a4d0ee18720d762d8"
+      "bytes": 11072,
+      "sha256": "13320926a2e5a49a77cc07698aa537ed6111ae2ca0b75e5692b75710c220e917"
     },
     {
       "path": "dist/src/client/rfc-errors.d.ts",
@@ -107,13 +107,13 @@
     },
     {
       "path": "dist/src/compat/node-rfc-client.d.ts",
-      "bytes": 5768,
-      "sha256": "0b7491cdb73cef8bec0799b319fd47c5b52d4f27f390fbba5e843e42f9931b0f"
+      "bytes": 6009,
+      "sha256": "90b7f0dc15877c1600fc4e87dee4c5d31d5135308b7ba49e6833943637fbdabf"
     },
     {
       "path": "dist/src/compat/node-rfc-library.d.ts",
-      "bytes": 2745,
-      "sha256": "d6b457adda1785d6eb67375b2d1674459aefe6183b6da595f9e06be50f52341f"
+      "bytes": 3037,
+      "sha256": "bc4fa942180b4deea0be64ab67cdb102aef473428927b763872d2163e3880b37"
     },
     {
       "path": "dist/src/compat/node-rfc-pool.d.ts",
@@ -157,8 +157,8 @@
     },
     {
       "path": "dist/src/destination/direct-destination-owner.d.ts",
-      "bytes": 9915,
-      "sha256": "c5a90900ad1b38a4a921d9fe87a97d12fa0b9434dc502389523657d222bd2325"
+      "bytes": 9985,
+      "sha256": "38400ddbd9c6e2986c70a8be2407df530cb6b2968bbfd3de93edfd5c304fe1ef"
     },
     {
       "path": "dist/src/destination/runtime.d.ts",
@@ -172,8 +172,8 @@
     },
     {
       "path": "dist/src/index.d.ts",
-      "bytes": 2237,
-      "sha256": "cdc794d59651f53bbd34d5453da214630c2a4b7a6d51dbb24fdd544ae4f35bc3"
+      "bytes": 2310,
+      "sha256": "b378006cf366d0b8f2c2dc637e1dc801c9b2f6733ee6fb9639efdca91bc7b87c"
     },
     {
       "path": "dist/src/lifecycle/session-context-runtime.d.ts",
@@ -396,5 +396,5 @@
       "sha256": "3f7281a9719647b7faeb0c15cd021310eb4ddec4269c379380813dd129db7859"
     }
   ],
-  "aggregateSha256": "e6343eba27a488561a3f1083f78df46ead87b4451349f87e6c3772f41636047a"
+  "aggregateSha256": "2ef598ff9eed72e2c12f8d5723e794a882df8f3b4f6c45d4fbd3df8fcb1bfb59"
 }
