@@ -6,6 +6,7 @@ import {
   type Socket,
 } from "node:net";
 import test from "node:test";
+import { userInfo } from "node:os";
 
 import {
   CpicCallError,
@@ -107,6 +108,10 @@ test("opens, exchanges, and deallocates a semantic direct-CPIC session", async (
             assert.equal(parameters.clientIdentifier, "NWRFC");
             assert.equal(parameters.options.optionFlags, 1);
             assert.equal(parameters.options.longLogicalUnitName, "127.0.0.1");
+            assert.equal(
+              parameters.options.operatingSystemUser,
+              userInfo().username.slice(0, 12),
+            );
             socket.write(
               encodeNiFrame(
                 encodeAppcControlRecord({

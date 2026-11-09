@@ -98,3 +98,4 @@ export {
   type RfcCallbackXrfcParameter,
   type RfcCallbackXrfcValue,
 } from "./protocol/rfc-callback.js";
+export { type RfcLocalIdentity } from "./client/direct-cpic-session.js";

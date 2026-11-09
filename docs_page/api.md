@@ -54,9 +54,113 @@ by `Pool.acquire()` is already open: return it with `client.release()` or
 Useful read-only properties include `alive`, `connectionHandle`, `pool_id`,
 `config`, and `connectionInfo`. Read-only does not mean redacted: `config`
 retains the connection snapshot, which can include credentials, while
-`connectionInfo` contains route and user identity when open and is an `Error`
-value while closed. Treat both as sensitive. Never log, serialize, attach, or
-return them from a diagnostics endpoint.
+`connectionInfo` contains configured identity, route information, and negotiation
+values when open and is an `Error` value while closed. Treat both as sensitive.
+Never log, serialize, attach, or return them from a diagnostics endpoint.
+
+### Connection information provenance
+
+`connectionInfo` is an immutable snapshot, not a backend identity verification.
+Opening a connection does not query an identity RFM. Its fields have these sources:
+
+| Fields | Source and meaning |
+|---|---|
+| `client`, `user`, `language` | Normalized connection configuration. They do not independently verify the effective backend identity. |
+| `host`, `partnerHost`, `sysNumber` | Selected application route for a dynamic destination, otherwise configured application host and system number. These are routing values, not backend identity readback. |
+| `partnerIP` | Selected or configured gateway host. Despite the compatibility name, this can be a hostname and is not an observed remote IP address. |
+| `partnerCodepage`, `partnerSystemCodepage` | Codepage received in gateway negotiation. This does not verify a backend system ID, user, or client. |
+| `isoLanguage` | Derived from the configured SAP language. |
+| `trace`, `codepage`, `rfcRole`, `type`, `partnerType`, `progName`, `partnerBytesPerChar` | Compatibility constants: `"0"`, `"4103"`, `"C"`, `"3"`, `"3"`, `"open-rfc"`, and `"2"`, respectively. |
+| `dest`, `sysId`, `rel`, `partnerRel`, `kernelRel`, `cpicConvId`, `partnerIPv6` | Unavailable; returned as `""`. Empty values are not successful verification. |
+
+`connectionHandle` identifies a physical session generation within this process.
+It changes on replacement even when SAP reuses its gateway connection-table
+index; it is zero while no generation is attached. A reset or reattachment of
+the same pooled session can retain the handle. It is not a durable identifier
+or a SAP LUW identifier. If the application performs its own identity readback,
+bind that evidence to the handle and invalidate it after replacement, close,
+release, or termination of the owning workflow. A previously returned snapshot
+cannot revoke itself after the client closes.
+
+### Session-bound classic workflows
+
+Fatal errors retire the old physical session. The classic client may already
+have installed a replacement when the original Promise rejects or callback runs.
+The failed invocation is never replayed. `alive === true` describes the current
+generation and says nothing about the old request's effect or LUW.
+
+| Event | Classic client behavior | Session workflow action |
+|---|---|---|
+| Normal reply | Same generation remains available. | Continue only within the application's workflow rules. |
+| Proven application pre-send rejection, including canceled metadata preflight, or fully decoded reusable exception | Application generation can remain unchanged. | Correct input or apply explicit business policy. |
+| Fatal response, timeout/cancellation after possible send, or malformed reply | Retire the generation; replacement may succeed. No automatic replay. | Stop the old workflow and reconcile any uncertain effect. |
+| Call queued behind a fatal call | The queued call uses the generation available when it reaches dispatch, which may be the replacement. | Do not enqueue old-session follow-ups directly on a shared client. |
+| Late reply after retirement | The retired transport cannot supply another invocation's result. | Do not treat replacement success as evidence about the old call. |
+| Close | Cancel active calls, join cleanup, and clear the handle. | Await original call outcomes and invalidate saved session evidence. |
+
+A handle check immediately before `client.call()` is insufficient when another
+operation already owns the client's queue. For a classic LUW or XMI sequence,
+give one workflow exclusive ownership of the client and check the generation
+inside an application queue before admitting each call. This conservative example
+ends the workflow on **any** call error, including local and reusable errors:
+
+```ts
+import type { Client, RfcCallOptions, RfcObject } from "open-rfc";
+
+function generationBoundConsumer(client: Client) {
+  if (client.config.clientOptions?.stateless === true) {
+    throw new Error("session workflow requires a stateful client");
+  }
+  if (!client.alive || client.connectionHandle === 0) {
+    throw new Error("session workflow requires an open client");
+  }
+  const generation = client.connectionHandle;
+  let stopped = false;
+  let tail = Promise.resolve();
+  const active = () =>
+    !stopped && client.alive && client.connectionHandle === generation;
+
+  return {
+    get active() { return active(); },
+    call(name: string, input: RfcObject, options?: RfcCallOptions) {
+      const pending = tail.then(async () => {
+        if (!active()) {
+          stopped = true;
+          throw new Error("session workflow is no longer active");
+        }
+        try {
+          return await client.call(name, input, options);
+        } catch (error) {
+          stopped = true;
+          throw error;
+        }
+      });
+      tail = pending.then(() => undefined, () => undefined);
+      return pending;
+    },
+  };
+}
+```
+
+Create the wrapper only after `open()` or `Pool.acquire()`, with `stateless`
+disabled. A server context reset can retain the physical handle while ending
+LUW/XMI continuity, so handle equality alone cannot make stateless calls one
+session workflow. All calls for that
+workflow must go through it; no other code may call, ping, reset, release, close,
+or reuse the client concurrently. Stop admission and await outstanding work
+before normal close or pool release. Cancellation may signal the client, but
+the original call still owns its terminal outcome. This queue adds waiting
+outside the SDK: enforce the application's queue bound and end-to-end deadline
+separately; the SDK call timeout starts when `client.call()` is invoked.
+
+Identity evidence obtained through the workflow remains usable only while
+`workflow.active` is true and the saved handle equals `client.connectionHandle`.
+Clear it when that check fails, even if configured `connectionInfo` fields look
+identical on the replacement. A new workflow requires a new business decision
+and any required identity readback; it does not resolve an old ambiguous call.
+For supported transaction use cases, the [modern transaction API](#modern-rfcclient-and-rfcconnection)
+already pins one physical session, rejects concurrent transaction operations,
+and becomes terminal after an ambiguous failure.
 
 ### Client and call options
 
@@ -72,6 +176,7 @@ return them from a diagnostics endpoint.
 | `clientOptions.diagnostics` | Optional bounded structured diagnostic emitter. Never emit RFC inputs, outputs, or credentials from application wrappers. |
 | `clientOptions.recursiveSerializerPolicy` | Advanced open-rfc extension for recursive (nested table or structure) sends. Shape: `{ profile, observation: { defaultSerializer, basxmlDisabledSerializer } }`, where `profile` is `"abap-7.50"` or `"abap-7.58"`, `defaultSerializer` is `"classic-xrfc"`, `"basxml"` or `"unsupported"`, and `basxmlDisabledSerializer` is `"classic-xrfc"` or `"unsupported"`. Omit it unless the exact artifact's published support record supports the selected partner and value graph. Without a policy, recursive calls use classic xRFC only when function metadata explicitly says basXML is unsupported; basXML-capable or unknown functions fail closed. |
 | `clientOptions.callbacks` | Preview handlers for server-initiated `DESTINATION 'BACK'` calls, keyed by exact RFM name. A handler receives owned raw classic-RFC values plus `{ callbackIndex, signal }` and must synchronously return a plain own-data `{ exports?, tables?, xrfcParameters? }` or `{ exception }` response. Returned parameter names must be present in `request.requestedOutputs`; each raw xRFC result name must match its XML root. Unknown callback RFMs receive `FU_NOT_FOUND`; malformed, unconfigured, asynchronous, or excessive callback activity fails closed. |
+| `clientOptions.localIdentity` | open-rfc extension: `{ osUser?, hostname? }` sent during the direct CPIC handshake instead of `os.userInfo().username` and `os.hostname()`. `osUser` is 1..12 and `hostname` 1..120 visible ASCII characters; invalid values are rejected at construction, never truncated. Each supplied field replaces its lookup; an omitted field keeps the fail-closed OS lookup. See [Local user and host names](operations.md#local-user-and-host-names). |
 
 `cancel()` signals active calls and resolves after signaling; await the original
 call promise or callback for its terminal outcome. A timeout or cancellation is
@@ -260,8 +365,8 @@ supported way to abort and join active connection operations.
 operationally sensitive route and user identity. The optional constructor
 logger has a `log(type, ...args)` method; open-rfc sends it only fixed lifecycle
 messages. `RFCClient` configuration accepts the same advanced
-`recursiveSerializerPolicy` and raw synchronous `callbacks` preview described
-for `Client` above.
+`recursiveSerializerPolicy`, raw synchronous `callbacks` preview, and
+`localIdentity` described for `Client` above.
 
 `execute()` accepts direction-specific `import`, `changing`, and `table`
 buckets. A parameter may appear in only one bucket. Validation is enabled by

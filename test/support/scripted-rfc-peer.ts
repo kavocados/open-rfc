@@ -44,6 +44,7 @@ export type ScriptedRfcDataReply =
 
 export type ScriptedRegularRfcReply =
   | ScriptedRfcDataReply
+  | { readonly kind: "held"; readonly reply: ScriptedRfcDataReply }
   | {
       /** Re-entrant server→client requests sent before the outer response. */
       readonly kind: "callbacks";
@@ -70,6 +71,7 @@ export interface ScriptedRfcGeneration {
 }
 
 interface GenerationState {
+  readonly socket: Socket;
   readonly script: ScriptedRfcGeneration;
   readonly replies: ScriptedRegularRfcReply[];
   readonly conversationId: Buffer;
@@ -79,6 +81,7 @@ interface GenerationState {
   barrierCount: number;
   streamedApplicationBytes: number;
   streamedDataOrdinal: number | undefined;
+  heldReply?: ScriptedRfcDataReply;
   pendingCallbacks?: {
     readonly requests: readonly Uint8Array[];
     readonly final: ScriptedRfcDataReply;
@@ -119,6 +122,7 @@ export class ScriptedRfcPeer {
   readonly #states: GenerationState[] = [];
   #failure: unknown;
   #connectionCount = 0;
+  #peakConnectionCount = 0;
   readonly port: number;
 
   private constructor(
@@ -159,6 +163,20 @@ export class ScriptedRfcPeer {
     return this.#connectionCount;
   }
 
+  get activeConnectionCount(): number { return this.#sockets.size; }
+  get peakConnectionCount(): number { return this.#peakConnectionCount; }
+
+  /** Release a controlled reply; a closed generation cannot receive it. */
+  releaseHeldReply(generation: number): boolean {
+    const state = this.#states[generation];
+    if (state?.heldReply === undefined) throw new Error("no held RFC reply");
+    const reply = state.heldReply;
+    delete state.heldReply;
+    if (state.socket.destroyed) return false;
+    this.#sendDataReply(state.socket, state, reply);
+    return true;
+  }
+
   regularRequestCount(generation: number): number {
     return this.#states[generation]?.regularRequestCount ?? 0;
   }
@@ -181,6 +199,7 @@ export class ScriptedRfcPeer {
       return;
     }
     const state: GenerationState = {
+      socket,
       script,
       replies: [...(script.replies ?? [])],
       conversationId: Buffer.from(`${index + 1}`.padStart(8, "0"), "ascii"),
@@ -193,6 +212,7 @@ export class ScriptedRfcPeer {
     };
     this.#states[index] = state;
     this.#sockets.add(socket);
+    this.#peakConnectionCount = Math.max(this.#peakConnectionCount, this.#sockets.size);
     const decoder = new NiFrameDecoder();
     socket.on("data", (chunk) => {
       try {
@@ -225,6 +245,11 @@ export class ScriptedRfcPeer {
       return;
     }
     if (reply.kind === "silence") return;
+    if (reply.kind === "held") {
+      if (state.heldReply !== undefined) throw new Error("RFC reply already held");
+      state.heldReply = reply.reply;
+      return;
+    }
     if (reply.kind === "callbacks") {
       if (reply.requests.length === 0) {
         throw new Error("scripted callback reply needs at least one request");

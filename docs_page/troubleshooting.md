@@ -16,6 +16,7 @@
 | Callback receives `FU_NOT_FOUND` | No exact handler name is configured | Match the ABAP callback RFM name exactly; do not add a catch-all handler. |
 | Callback closes the session | Unconfigured callback, malformed framing, asynchronous handler, or callback limit | Verify `clientOptions.callbacks`, keep handlers synchronous, and inspect only redacted structural diagnostics. |
 | Timeout/cancel after send | Ambiguous business outcome | Retire the connection and reconcile; never replay automatically. |
+| `RFC_ILLEGAL_STATE` with key `RFC_OS_USER_*` or `RFC_LOCAL_HOSTNAME_*` before connecting | The local OS account or host name is unavailable or not ASCII | Fix the account or host name, or set `clientOptions.localIdentity`; see [Local user and host names](operations.md#local-user-and-host-names). |
 
 ## Connection fails before logon
 

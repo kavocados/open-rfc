@@ -331,6 +331,86 @@ If release fails, still attempt `closeAll()` and preserve both failures.
 - A timeout, cancellation, malformed reply, or uncertain send retires the
   physical connection and is never replayed automatically.
 
+### IMPORT inputs and returned values
+
+Parameter directions below use the function module's ABAP perspective. An
+IMPORTING (`I`) value is input to the backend. open-rfc does not include an
+IMPORTING echo in the call result. If your previous adapter returned that input,
+keep an explicit input snapshot in your application instead of treating it as
+backend output. The default result contains requested EXPORTING (`E`), active
+CHANGING (`C`), and TABLES (`T`) values.
+
+| Direction | Input behavior | Returned value |
+| --- | --- | --- |
+| `I` | Explicit input is sent, including `""` and numeric `0`. An omitted mandatory input gets its initial value; an omitted optional input retains the backend default. | No input echo, including for omitted or initial inputs. |
+| `E` | Cannot be supplied as input. | Requested by default; a missing requested value fails the call. |
+| `C` | Supplied or mandatory input is active; an omitted optional input is inactive. | The backend's value when active, which may differ from the input. |
+| `T` | Input rows are sent when supplied or mandatory, within serializer limits. | Output is requested even when optional input is omitted. |
+
+For a function whose IMPORTING parameters are `TEXT` and `NUMBER`, an existing
+consumer that needs a combined view can explicitly project those inputs after a
+successful call:
+
+```ts
+const input = { TEXT: "", NUMBER: 0, COUNT: 0, ROWS: ["one"] };
+// COUNT and ROWS are C/T values; only the I parameters belong in this echo.
+const inputEcho = { TEXT: input.TEXT, NUMBER: input.NUMBER };
+const output = await client.call("Z_DIRECTION_FIXTURE", input);
+for (const name of Object.keys(inputEcho)) {
+  if (Object.hasOwn(output, name)) {
+    throw new Error(`input echo collides with output ${name}`);
+  }
+}
+const applicationView = { ...inputEcho, ...output };
+```
+
+This is an application view; it does not change the RFC response or prove that
+the backend accepted an echoed value. Copy only explicitly supplied `I` fields
+using the function's known metadata, and snapshot mutable structures or binary
+values before starting the call. Do not merge all inputs: doing so can overwrite
+or conceal CHANGING/TABLES outputs. Do not invent echoed values for omitted
+optional inputs, whose backend defaults are not observed by this call. Avoid
+truthiness checks when copying input because empty CHAR and numeric zero are
+valid values.
+
+For migration parity comparisons, keep the previous adapter's observed result
+separate from this display projection. Identify `I` keys from metadata; before
+removing an echoed `I` key from the comparison, require that it was explicitly
+supplied and equals the original input snapshot, including `""` and `0`.
+A conflicting echo fails the comparison. An echo for an omitted input needs a
+separate, justified default-value contract. Then compare all remaining keys and
+values exactly, preserving unknown fields and required E/C/T outputs so neither
+extra fields nor missing or changed outputs can disappear during normalization.
+The repository's synthetic legacy envelopes exercise this comparator rule; they
+are not results from running the native node-rfc package.
+
+An unexpected `I` field on the wire, unknown output, duplicate output, or missing
+requested output fails response validation. `notRequested` changes the outgoing
+request and therefore the backend's `IS REQUESTED` behavior; it is not a local
+filter for constructing an echo. Suppressed E/C/T outputs have their documented
+initial values, and suppressing a TABLES parameter also suppresses its input.
+
+### TABLES parameters described by `EXID h`
+
+The table-container descriptor `EXID h` has a narrower classic TABLES boundary
+than ordinary flat table rows. Omission does not establish that the backend will
+return an empty table. Serializer applicability and metadata authorization must
+also succeed before the following cases apply.
+
+| Case | Business request | Result and connection |
+| --- | --- | --- |
+| Supplied input, including `[]`; omitted mandatory input; explicitly activated input | Rejected before sending | Local preparation error; authenticated session remains usable. |
+| Omitted optional input, empty binary output | Sent once | Returns `[]`; session remains usable. |
+| Omitted optional input, nonempty binary output | Sent once | Value decoding fails after the response; physical session is retired. |
+| Malformed binary output envelope | Sent once | Value decoding rejects the envelope after the response; physical session is retired. |
+| Output deliberately suppressed with `notRequested` | Sent once without requesting that output | Returns the initial `[]`; input is also inactive. |
+
+The post-send failures do not establish that SAP had no effect, and a new
+connection does not make replay safe. Use `notRequested` only when the output is
+unnecessary for the business operation. Do not hide a required output to turn an
+unsupported call into apparent success. These contracts are covered by synthetic
+direction and session tests; they do not expand the published live support matrix.
+
 Before deploying, exercise every decimal, INT8, binary, initial temporal,
 structure, table, error, cancellation, and requested-output shape used by the
 application. Start with an approved read-only function on a non-production

@@ -41,7 +41,7 @@
     "lint": "oxlint src test tools",
     "test": "npm run test:code",
     "test:code": "npm run build && node --test dist/test/*.test.js",
-    "test:surface": "npm run build --silent && node --test test/api-subpath-contract.test.mjs test/build-output-clean.test.mjs test/dual-loader-error-brand.test.mjs test/public-api-snapshot.test.mjs",
+    "test:surface": "npm run build --silent && node --test test/api-subpath-contract.test.mjs test/build-output-clean.test.mjs test/dual-loader-error-brand.test.mjs test/public-api-snapshot.test.mjs test/fork-package-contract.test.mjs",
     "docs:build": "node tools/build_docs.mjs",
     "benchmark:protocol": "npm run build --silent && node tools/protocol_benchmark.mjs"
   },

@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
 
 import {
   buildClassicRfcInvocationRequest,
   decodeClassicRfcInvocationResult,
 } from "../src/client/classic-invocation.js";
+import {
+  DirectCpicPreWireError,
+  DirectCpicSession,
+} from "../src/client/direct-cpic-session.js";
+import {
+  RfcConnectionDisposition,
+  RfcCoreError,
+  RfcOperationPhase,
+  RfcReplayPolicy,
+  RfcTransmissionState,
+} from "../src/client/rfc-failure.js";
 import type { RfcFunctionInterface } from
   "../src/metadata/rfc-function-interface.js";
 import {
@@ -16,6 +28,9 @@ import {
   decodeCpicFieldChainPrefix,
   type CpicField,
 } from "../src/protocol/cpic.js";
+import {
+  ScriptedRfcPeer, successfulRegularFields,
+} from "./support/scripted-rfc-peer.js";
 
 const FUNCTION_NAME = "Z_NESTED_XRFC";
 
@@ -91,6 +106,7 @@ function typeRow(options: {
 function graph(
   functionName = FUNCTION_NAME,
   includeTablesParameter = false,
+  remoteBasxmlSupported = true,
 ): RecursiveMetadataGraph {
   const parameter = (
     name: string,
@@ -116,7 +132,7 @@ function graph(
   return normalizeRecursiveMetadataGraph({
     FUNCTIONNAMES: [{
       FUNCTIONNAME: functionName,
-      BASXML_SUPPORTED: "X",
+      BASXML_SUPPORTED: remoteBasxmlSupported ? "X" : "",
       UDAT: "20260716",
       UTIME: "123456",
     }],
@@ -493,4 +509,92 @@ test("explicitly suppressed recursive TABLES retains its initial value", () => {
     decodeBinaryTable([{ tag: CpicTag.End, value: Buffer.alloc(0) }], { notRequested: new Set(["TABLE"]) }),
     { TABLE: [] },
   );
+});
+
+test("recursive TABLES session distinguishes pre-send refusal from consumed response failure", async (t) => {
+  const recursive = graph(FUNCTION_NAME, true, false);
+  const optionalMetadata: RfcFunctionInterface = {
+    ...binaryTableMetadata,
+    remoteBasxmlSupported: false,
+    parameters: binaryTableMetadata.parameters.map(parameter => ({
+      ...parameter, optional: true,
+    })),
+  };
+  for (const current of [
+    { name: "supplied empty", input: { TABLE: [] }, options: {} },
+    { name: "supplied rows", input: { TABLE: INPUT.ROWS }, options: {} },
+    { name: "activated optional", input: {}, options: { activated: new Set(["TABLE"]) } },
+    { name: "mandatory initial", input: {}, options: {}, mandatory: true },
+  ]) {
+    await t.test(current.name, async (subtest) => {
+      const peer = await ScriptedRfcPeer.start([{}]);
+      subtest.after(() => peer.close());
+      const session = await DirectCpicSession.open({
+        host: "127.0.0.1", port: peer.port,
+        applicationServerService: "sapdp00", operationTimeoutMs: 1_000,
+      });
+      subtest.after(() => session.close());
+      await session.logonAndPing({ client: "001", user: "SYNTHETIC", password: "synthetic" });
+      const metadata = current.mandatory
+        ? { ...binaryTableMetadata, remoteBasxmlSupported: false }
+        : optionalMetadata;
+      await assert.rejects(session.invokeClassicWithMetadata(
+        metadata, current.input, new Map(), undefined, current.options, recursive,
+      ), (error: unknown) => {
+        assert.ok(error instanceof DirectCpicPreWireError);
+        assert.match(String(error.cause), /recursive TABLES input encoding is not implemented/u);
+        return true;
+      });
+      assert.equal(peer.regularRequestCount(0), 0);
+      assert.equal(session.state, "authenticated");
+      assert.equal(peer.connectionCount, 1);
+    });
+  }
+  for (const current of [
+    { name: "empty", fields: binaryTableFields(0), options: {}, succeeds: true },
+    { name: "nonempty", fields: binaryTableFields(1, [Buffer.alloc(12)]), options: {}, succeeds: false },
+    { name: "malformed envelope", fields: binaryTableFields(1), options: {}, succeeds: false },
+    {
+      name: "not requested", fields: [{ tag: CpicTag.End, value: Buffer.alloc(0) }],
+      options: { notRequested: new Set(["TABLE"]) }, succeeds: true,
+    },
+  ]) {
+    await t.test(current.name, async (subtest) => {
+      const peer = await ScriptedRfcPeer.start([{
+        replies: [{
+          kind: "fields", fields: [...successfulRegularFields().slice(0, -1), ...current.fields],
+        }],
+      }]);
+      subtest.after(() => peer.close());
+      const session = await DirectCpicSession.open({
+        host: "127.0.0.1", port: peer.port,
+        applicationServerService: "sapdp00", operationTimeoutMs: 1_000,
+      });
+      subtest.after(() => session.close());
+      await session.logonAndPing({ client: "001", user: "SYNTHETIC", password: "synthetic" });
+      const pending = session.invokeClassicWithMetadata(
+        optionalMetadata, {}, new Map(), undefined, current.options, recursive,
+      );
+      if (current.succeeds) {
+        assert.deepEqual(await pending, { TABLE: [] });
+        assert.equal(session.state, "authenticated");
+      } else {
+        await assert.rejects(pending, (error: unknown) => {
+          assert.ok(error instanceof RfcCoreError);
+          assert.equal(error.failure.phase, RfcOperationPhase.ValueDecode);
+          assert.equal(error.failure.transmission, RfcTransmissionState.Complete);
+          assert.equal(error.failure.disposition, RfcConnectionDisposition.UnknownClose);
+          assert.equal(error.failure.replayPolicy, RfcReplayPolicy.Never);
+          return true;
+        });
+        assert.equal(session.state, "closed");
+        await assert.rejects(session.ping());
+        const deadline = Date.now() + 1_000;
+        while (peer.activeConnectionCount !== 0 && Date.now() < deadline) await nextTurn();
+        assert.equal(peer.activeConnectionCount, 0, "failed generation socket did not close");
+      }
+      assert.equal(peer.regularRequestCount(0), 1);
+      assert.equal(peer.connectionCount, 1);
+    });
+  }
 });

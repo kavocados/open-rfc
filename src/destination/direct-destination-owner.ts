@@ -8,6 +8,8 @@ import {
   type DirectCpicPingResult,
   type DirectCpicSessionInfo,
   type DirectCpicTransportFactory,
+  type RfcLocalIdentity,
+  snapshotRfcLocalIdentity,
 } from "../client/direct-cpic-session.js";
 import {
   classicInvocationRecursiveMetadataParameters,
@@ -118,6 +120,7 @@ export interface DirectDestinationSessionOptions {
   readonly transportFactory?: DirectCpicTransportFactory;
   readonly recursiveSerializerDecisionProvider?: RecursiveSerializerDecisionProvider;
   readonly callbacks?: RfcCallbackHandlers;
+  readonly localIdentity?: RfcLocalIdentity;
 }
 
 export interface DirectDestinationPoolOptions {
@@ -231,6 +234,7 @@ interface CanonicalSessionOptions {
   readonly transportFactory?: DirectCpicTransportFactory;
   readonly recursiveSerializerDecisionProvider?: RecursiveSerializerDecisionProvider;
   readonly callbacks?: RfcCallbackHandlers;
+  readonly localIdentity?: RfcLocalIdentity;
 }
 
 interface CanonicalPoolOptions {
@@ -556,6 +560,10 @@ function snapshotSessionOptions(
   const recursiveSerializerDecisionProvider =
     input?.recursiveSerializerDecisionProvider;
   const callbacks = input?.callbacks;
+  const localIdentity = snapshotRfcLocalIdentity(
+    input?.localIdentity,
+    "session localIdentity",
+  );
   if (!/^[\x20-\x7e]{1,64}$/u.test(programName)) {
     throw new RangeError("session programName must contain 1..64 ASCII bytes");
   }
@@ -602,6 +610,7 @@ function snapshotSessionOptions(
     ...(snapshottedCallbacks === undefined
       ? {}
       : { callbacks: snapshottedCallbacks }),
+    ...(localIdentity === undefined ? {} : { localIdentity }),
   });
 }
 
@@ -711,6 +720,9 @@ function createProductionSessionFactory(
         ...(options.callbacks === undefined
           ? {}
           : { callbacks: options.callbacks }),
+        ...(options.localIdentity === undefined
+          ? {}
+          : { localIdentity: options.localIdentity }),
       }]) as DirectCpicSession;
       const logon = callable(session.logonAndPing, "session.logonAndPing");
       const close = callable(session.close, "session.close");

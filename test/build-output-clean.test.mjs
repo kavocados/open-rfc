@@ -137,7 +137,13 @@ test("package mode normalization covers the complete npm surface", (t) => {
     "dist/cjs/package.json",
   ];
   for (const path of files) {
-    writeFixtureFile(join(root, path));
+    // Keep package manifests valid: recent Node loaders inspect the enclosing
+    // package before the mode-normalization script can run.
+    if (path === "dist/cjs/package.json") {
+      writeFixtureFile(join(root, path), '{"type":"commonjs"}\n');
+    } else if (path !== "package.json") {
+      writeFixtureFile(join(root, path));
+    }
     chmodSync(join(root, path), 0o600);
   }
   for (const path of ["dist", "dist/src", "dist/src/nested", "dist/cjs"]) {
